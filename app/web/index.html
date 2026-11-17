@@ -53,6 +53,8 @@
   .pill.mismatch { background:#fee2e2; color:var(--bad); }
   .pill.shadow_timeout,.pill.shadow_error { background:#fef3c7; color:var(--warn); }
   .pill.shadow_skipped_no_slot { background:#e0e7ff; color:#3730a3; }
+  .pill.shadow_skipped_breaker_open { background:#fecaca; color:#991b1b; }
+  .pill.shadow_skipped_probe_wait { background:#fde68a; color:#92400e; }
   .pill.client_disconnected,.pill.primary_error,.pill.primary_incomplete,
   .pill.shadow_pending {
           background:#f1f5f9; color:#475569; }
@@ -62,6 +64,19 @@
   .poll-line { font-size:12px; color:var(--mut); margin-bottom:8px; display:flex;
            justify-content:space-between; gap:10px; align-items:center; }
   code.path { background:#f1f5f9; padding:1px 5px; border-radius:4px; font-size:11px; }
+  .brk-grid { display:grid; grid-template-columns:auto 1fr; gap:6px 12px; font-size:12px;
+              margin:10px 0; }
+  .brk-grid .k { color:var(--mut); }
+  .brk-state { font-weight:700; padding:2px 9px; border-radius:999px; font-size:12px;
+               display:inline-block; }
+  .brk-state.closed { background:#dcfce7; color:var(--ok); }
+  .brk-state.open { background:#fecaca; color:#991b1b; }
+  .brk-state.probe { background:#fde68a; color:#92400e; }
+  .brk-state.disabled { background:#e2e8f0; color:#475569; }
+  .probe-tag { background:#fde68a; color:#92400e; border-radius:4px; padding:0 4px;
+               font-size:10px; font-weight:700; margin-left:4px; }
+  .switch-row { display:flex; align-items:center; gap:10px; margin-top:6px; }
+  .switch-row input[type=checkbox] { width:auto; }
 </style>
 </head>
 <body>
@@ -70,7 +85,30 @@
   <span class="stat" id="gwstat">connecting…</span>
 </header>
 <main>
-  <section class="card">
+  <section>
+    <div class="card" style="margin-bottom:16px">
+      <h2>熔断保护（影子流量）</h2>
+      <div class="brk-grid">
+        <span class="k">保护状态</span>
+        <span><span class="brk-state" id="brkState">…</span></span>
+        <span class="k">连续失败</span>
+        <span id="brkFails">…</span>
+        <span class="k">冷却剩余</span>
+        <span id="brkCooldown">—</span>
+        <span class="k">探针</span>
+        <span id="brkProbe">—</span>
+      </div>
+      <div class="switch-row">
+        <input type="checkbox" id="brkEnabled" checked>
+        <label for="brkEnabled" style="margin:0">启用熔断保护（关闭后影子不受熔断限制；重新启用从零计数）</label>
+      </div>
+      <p class="hint">
+        网络错误/超时/完整 5xx 计 1 次失败，完整非 5xx 归零，内容差异与客户端断连不计。
+        连续 3 次失败停发影子 5 秒，主请求照常透传；到期仅 1 个请求作为探针，
+        探针成功（完整非 5xx）才恢复，失败再冷却 5 秒。探针仍占 4 个影子名额。
+      </p>
+    </div>
+    <div class="card">
     <h2>发起请求</h2>
     <label>端点</label>
     <select id="endpoint">
@@ -90,8 +128,11 @@
         <label>场景开关</label>
         <select id="scenario">
           <option value="">默认 (两端一致)</option>
-          <option value="diff=1">diff=1 影子制造差异</option>
+          <option value="diff=1">diff=1 影子制造差异(不算故障)</option>
           <option value="fail=1">fail=1 两端强制 500</option>
+          <option value="s_fail=1">s_fail=1 仅影子端 500(熔断演示)</option>
+          <option value="s_delay=3">s_delay=3 仅影子端超时(熔断演示)</option>
+          <option value="s_reset=1">s_reset=1 仅影子端断连(网络错误演示)</option>
         </select>
       </div>
       <div>
@@ -105,8 +146,9 @@
     </div>
     <p class="hint">
       网关固定并行调用主端与影子端；客户端只收主端原始字节。影子
-      2 秒硬超时、最多 4 个并发，满额跳过并在记录中注明。
+      2 秒硬超时、最多 4 个并发，满额跳过并在记录中注明；熔断打开时影子被跳过并注明原因。
     </p>
+    </div>
   </section>
 
   <section class="grid2">
@@ -234,19 +276,64 @@ $('clear').onclick = () => {
 const RESULT_TEXT = {
   match: '一致', mismatch: '不一致', shadow_timeout: '影子超时',
   shadow_error: '影子失败', shadow_skipped_no_slot: '影子跳过(名额满)',
+  shadow_skipped_breaker_open: '影子跳过(熔断打开)',
+  shadow_skipped_probe_wait: '影子跳过(等待探针)',
   client_disconnected: '客户端断连', primary_error: '主端失败',
   primary_incomplete: '主端不完整', shadow_completed_primary_incomplete: '主端未完成',
   shadow_pending: '影子进行中',
 };
 
+const BREAKER_TEXT = {
+  closed: '正常 (CLOSED)', open: '熔断打开 (OPEN)',
+  probe: '探针观察 (HALF-OPEN)', disabled: '保护已关闭',
+};
+
 function shortHash(h) { return h ? h.slice(0, 10) + '…' : '—'; }
+
+async function loadBreaker() {
+  try {
+    const b = await (await fetch('/api/breaker')).json();
+    const el = $('brkState');
+    el.textContent = BREAKER_TEXT[b.state] || b.state;
+    el.className = 'brk-state ' + b.state;
+    $('brkFails').textContent =
+      `${b.consecutive_failures} / ${b.failure_threshold} 次`;
+    $('brkCooldown').textContent = b.cooldown_remaining_s == null
+      ? '—' : `${b.cooldown_remaining_s} s`;
+    $('brkProbe').textContent = b.state === 'probe'
+      ? (b.probe_in_flight ? '探针在途，等待退出' : '等待下一请求作为探针')
+      : '—';
+    $('brkEnabled').checked = b.enabled;
+    return b;
+  } catch (e) {
+    $('brkState').textContent = '网关不可达';
+    return null;
+  }
+}
+
+$('brkEnabled').onchange = async (e) => {
+  e.target.disabled = true;
+  try {
+    await fetch('/api/breaker', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: e.target.checked }),
+    });
+  } catch (err) {
+    /* 网络错误时下次轮询会把开关刷回实际状态 */
+  }
+  await loadBreaker();
+  e.target.disabled = false;
+};
 
 async function loadRecords() {
   try {
     const recs = await (await fetch('/api/records')).json();
     const state = await (await fetch('/api/state')).json();
+    const b = state.breaker || {};
     $('gwstat').textContent =
       `影子在途 ${state.shadow_in_flight}/${state.shadow_capacity} · ` +
+      `熔断 ${BREAKER_TEXT[b.state] || b.state || '?'} · ` +
       `记录 ${state.records} 条 · 峰值 RSS ${state.max_rss_mib ?? '?'} MiB / 限额 96 MiB`;
     $('records').innerHTML = recs.map((r, i) => {
       const cls = (r.result || 'pending').replace(/[^a-z_]/g, '');
@@ -257,9 +344,10 @@ async function loadRecords() {
         ? `${r.shadow_status} · ${r.shadow_ms}ms<br><span class="mono">${shortHash(r.shadow_sha256)}</span>`
         : (r.shadow || '…');
       const reason = r.detail || (r.result === 'match' ? '状态码与 SHA-256 均相同' : '');
+      const probeTag = r.probe ? '<span class="probe-tag">探针</span>' : '';
       return `<tr>
         <td>${recs.length - i}</td>
-        <td><code class="path">${escapeHtml(r.target)}</code></td>
+        <td><code class="path">${escapeHtml(r.target)}</code>${probeTag}</td>
         <td><span class="pill ${cls}">${RESULT_TEXT[r.result] || r.result}</span></td>
         <td>${primary}</td>
         <td>${shadow}</td>
@@ -272,8 +360,11 @@ async function loadRecords() {
 }
 
 $('autopoll').onchange = () => {};
-setInterval(() => { if ($('autopoll').checked) loadRecords(); }, 1500);
+setInterval(() => {
+  if ($('autopoll').checked) { loadRecords(); loadBreaker(); }
+}, 1500);
 loadRecords();
+loadBreaker();
 </script>
 </body>
 </html>

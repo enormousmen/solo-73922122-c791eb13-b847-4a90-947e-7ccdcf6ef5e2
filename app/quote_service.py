@@ -10,7 +10,10 @@
 - delay=<秒>            首字节前延迟 (两端各自生效)
 - p_delay / s_delay     仅主端 / 仅影子端生效的延迟
 - status=<码>           自定义 HTTP 状态码
-- fail=1                立即返回 500
+- fail=1                立即返回 500 (两端同时)
+- s_fail=1              仅影子端立即返回 500 (主端保持正常, 熔断演示用)
+- s_status=<码>         仅影子端自定义状态码 (主端保持 status 默认)
+- s_reset=1             仅影子端发出首块后直接断开 TCP 连接 (模拟网络错误, 熔断演示用)
 - diff=1                影子端制造可比对的差异 (主端忽略)
 - size=<字节>           /quote-big 的响应大小 (默认 33554432 = 32MiB)
 - chunk_ms=<毫秒>       /quote-big 每块之间的延迟, 便于观察流式行为
@@ -68,6 +71,22 @@ async def quote(request: Request):
         await asyncio.sleep(delay)
 
     q = request.query_params
+
+    # 仅影子端故障注入 (主端忽略全部 s_* 故障参数)
+    if ROLE == "shadow":
+        if q.get("s_fail") == "1":
+            return JSONResponse(status_code=500, content={
+                "error": "forced shadow failure",
+            })
+        if q.get("s_reset") == "1":
+            # 发出首块后直接断开连接: 上游(网关)收到不完整响应, 归类为网络错误
+            async def reset_gen():
+                yield b'{"error":"connection reset'
+                raise ConnectionResetError("shadow forced connection reset")
+
+            return StreamingResponse(reset_gen(), status_code=200,
+                                     media_type="application/json")
+
     status = int(q.get("status", "200"))
 
     if q.get("fail") == "1":
@@ -106,12 +125,19 @@ async def quote_big(request: Request):
     chunk_ms = int(q.get("chunk_ms", "0"))
     status = int(q.get("status", "200"))
 
+    # 仅影子端故障注入 (主端忽略)
+    if ROLE == "shadow" and q.get("s_fail") == "1":
+        return JSONResponse(status_code=500, content={
+            "error": "forced shadow failure",
+        })
+
     if q.get("fail") == "1":
         return JSONResponse(status_code=500, content={
             "error": "forced failure",
         })
 
     shadow_diff = ROLE == "shadow" and q.get("diff") == "1"
+    shadow_reset = ROLE == "shadow" and q.get("s_reset") == "1"
 
     async def gen():
         if delay:
@@ -124,6 +150,9 @@ async def quote_big(request: Request):
             if shadow_diff and index == 0:
                 block = b"X" + block[1:]  # 首字节差异, 摘要必然不同
             yield block
+            if shadow_reset and index == 0:
+                # 首块已发出即断开: 模拟传输中途网络错误
+                raise ConnectionResetError("shadow forced connection reset")
             remaining -= n
             index += 1
             if chunk_ms:

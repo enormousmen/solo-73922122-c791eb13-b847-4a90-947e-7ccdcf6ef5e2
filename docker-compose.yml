@@ -9,6 +9,10 @@ services:
       SHADOW_URL: http://shadow:8000
       MAX_SHADOW_CALLS: "4"
       SHADOW_TIMEOUT_S: "2"
+      # 网页熔断保护: 默认启用; 连续 3 次影子失败打开, 冷却 5 秒
+      BREAKER_ENABLED: "1"
+      BREAKER_FAIL_THRESHOLD: "3"
+      BREAKER_COOLDOWN_S: "5"
     mem_limit: 96m
     mem_reservation: 64m
     depends_on:

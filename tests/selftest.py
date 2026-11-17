@@ -2,8 +2,15 @@
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
+
+# -I 隔离模式忽略 PYTHONPATH: 本地无 venv 时依赖装在 .pydeps
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEPS = os.path.join(_ROOT, ".pydeps")
+if os.path.isdir(_DEPS):
+    sys.path.insert(0, _DEPS)
 
 import aiohttp
 
@@ -34,6 +41,12 @@ async def wait_record(s, gw, marker, timeout_s=5.0):
 async def main():
     run_id = f"run{int(time.time() * 1000) % 1000000}"
     async with aiohttp.ClientSession() as s:
+        # 重置熔断保护: 保证每次自测从 closed/零计数开始, 用例间互不污染
+        try:
+            await s.post(f"{GW}/api/breaker", json={"enabled": False})
+            await s.post(f"{GW}/api/breaker", json={"enabled": True})
+        except Exception:
+            pass
         # 1. 基础一致: 主端原始字节透传 + match
         url = f"{GW}/quote?symbol=ZZZ&marker={run_id}-t1"
         async with s.get(url) as r:
@@ -62,6 +75,12 @@ async def main():
         check("3 记录为 shadow_timeout", rec["result"] == "shadow_timeout", rec["shadow"])
 
         # 4. 名额: 6 个真并发(各自独立 TCP 连接), 影子延迟占住名额, 主端零延迟
+        # 先重置熔断: 用例 3 的影子超时会累计失败计数, 避免熔断干扰名额语义验证
+        try:
+            await s.post(f"{GW}/api/breaker", json={"enabled": False})
+            await s.post(f"{GW}/api/breaker", json={"enabled": True})
+        except Exception:
+            pass
         async def one(i):
             # 独立 connector 保证 6 个请求同时在途, 而不是单连接流水线串行
             async with aiohttp.ClientSession() as cs:

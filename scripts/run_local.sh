@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-# 本地无 Docker 时的三服务启动脚本 (需先准备好虚拟环境: python -m venv .venv && .venv/bin/pip install -r requirements.txt)
+# 本地无 Docker 时的三服务启动脚本
+# 优先使用虚拟环境 .venv; 不存在时回退到 .pydeps (pip install --target .pydeps -r requirements.txt)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-PY=.venv/bin/python
+
+if [ -x .venv/bin/python ]; then
+  PY=.venv/bin/python
+  export PYTHONPATH="$PWD/.pydeps${PYTHONPATH:+:$PYTHONPATH}"
+elif [ -d .pydeps ]; then
+  PY=python3
+  export PYTHONPATH="$PWD/.pydeps${PYTHONPATH:+:$PYTHONPATH}"
+else
+  echo "缺少依赖: 先运行 python -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+  echo "或: python3 -m pip install --target .pydeps -r requirements.txt" >&2
+  exit 1
+fi
 
 SERVICE_ROLE=primary setsid nohup "$PY" -m uvicorn app.quote_service:app \
   --host 127.0.0.1 --port 8001 >/tmp/shadow-demo-primary.log 2>&1 < /dev/null &
